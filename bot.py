@@ -3,7 +3,9 @@ import sqlite3
 import time
 import threading
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+
+import requests
 
 from telegram import (
     Update,
@@ -26,6 +28,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+SERP_API_KEY = os.getenv("SERP_API_KEY")
 
 MONTHLY_STARS = 300
 YEARLY_STARS = 2100
@@ -33,7 +36,7 @@ YEARLY_STARS = 2100
 # ================= LOGGING =================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
@@ -87,6 +90,45 @@ def is_premium(user_id):
     _, expiry = get_user(user_id)
     return expiry > now()
 
+# ================= FLIGHT DATA =================
+
+def get_cheapest_flight(origin, destination):
+    """
+    Scans next 7 days and returns cheapest price
+    """
+    cheapest_price = None
+    cheapest_date = None
+
+    for i in range(1, 8):  # next 7 days
+        date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
+
+        url = "https://serpapi.com/search"
+
+        params = {
+            "engine": "google_flights",
+            "departure_id": origin,
+            "arrival_id": destination,
+            "outbound_date": date,
+            "currency": "USD",
+            "hl": "en",
+            "api_key": SERP_API_KEY
+        }
+
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+
+            price = data["best_flights"][0]["price"]
+
+            if cheapest_price is None or price < cheapest_price:
+                cheapest_price = price
+                cheapest_date = date
+
+        except Exception as e:
+            logging.error(f"Flight fetch error: {e}")
+
+    return cheapest_price, cheapest_date
+
 # ================= UI =================
 
 def main_menu():
@@ -107,7 +149,7 @@ def upgrade_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✈️ Welcome to Flightly!\nTrack cheap flights daily.",
+        "✈️ Welcome to Flightly!\nTrack real cheap flights daily.",
         reply_markup=main_menu()
     )
 
@@ -131,7 +173,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🔒 Premium required", reply_markup=upgrade_menu())
             return
 
-        await q.edit_message_text("🔥 MLE → DXB from $140")
+        price, date = get_cheapest_flight("MLE", "DXB")
+
+        if price:
+            msg = f"🔥 Cheapest Flight\n\nMLE → DXB\n💰 ${price}\n📅 {date}"
+        else:
+            msg = "⚠️ Could not fetch deals right now"
+
+        await q.edit_message_text(msg)
 
     elif data == "upgrade":
         await q.edit_message_text("Upgrade Flightly", reply_markup=upgrade_menu())
@@ -216,12 +265,16 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT id FROM users")
         users = cur.fetchall()
 
+    price, date = get_cheapest_flight("MLE", "DXB")
+
+    if price:
+        message = f"✈️ Flightly Daily Deal\n\nMLE → DXB\n💰 ${price}\n📅 {date}"
+    else:
+        message = "⚠️ Could not fetch flight deals today"
+
     for u in users:
         try:
-            await context.bot.send_message(
-                u[0],
-                "✈️ Daily Deal: MLE → DXB from $140"
-            )
+            await context.bot.send_message(u[0], message)
         except Exception as e:
             logging.error(f"Daily send failed {u[0]}: {e}")
 
@@ -239,7 +292,7 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
-    # DAILY JOB (runs every day at 09:00 server time)
+    # Runs daily at 09:00 UTC
     job = app.job_queue
     job.run_daily(daily_job, time=datetime.strptime("09:00", "%H:%M").time())
 
