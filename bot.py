@@ -27,8 +27,14 @@ from telegram.ext import (
 # ================= CONFIG =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SERP_API_KEY = os.getenv("SERP_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN missing in environment variables")
+
+if not SERP_API_KEY:
+    raise ValueError("SERP_API_KEY missing in environment variables")
 
 MONTHLY_STARS = 300
 YEARLY_STARS = 2100
@@ -75,7 +81,10 @@ def get_user(user_id):
         row = cur.fetchone()
 
         if not row:
-            cur.execute("INSERT INTO users (id, subscription_expiry) VALUES (?, ?)", (user_id, 0))
+            cur.execute(
+                "INSERT INTO users (id, subscription_expiry) VALUES (?, ?)",
+                (user_id, 0)
+            )
             conn.commit()
             return (user_id, 0)
 
@@ -83,7 +92,10 @@ def get_user(user_id):
 
 def update_user(user_id, expiry):
     with db_lock:
-        cur.execute("UPDATE users SET subscription_expiry=? WHERE id=?", (expiry, user_id))
+        cur.execute(
+            "UPDATE users SET subscription_expiry=? WHERE id=?",
+            (expiry, user_id)
+        )
         conn.commit()
 
 def is_premium(user_id):
@@ -93,16 +105,13 @@ def is_premium(user_id):
 # ================= FLIGHT DATA =================
 
 def get_cheapest_flight(origin, destination):
-    """
-    Scans next 7 days and returns cheapest price
-    """
     cheapest_price = None
     cheapest_date = None
 
-    for i in range(1, 8):  # next 7 days
+    for i in range(1, 8):
         date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
 
-        url = "https://serpapi.com/search"
+        url = "https://serpapi.com/search.json"
 
         params = {
             "engine": "google_flights",
@@ -118,11 +127,21 @@ def get_cheapest_flight(origin, destination):
             r = requests.get(url, params=params, timeout=10)
             data = r.json()
 
-            price = data["best_flights"][0]["price"]
+            best = data.get("best_flights", [])
+            other = data.get("other_flights", [])
+            flights = best + other
 
-            if cheapest_price is None or price < cheapest_price:
-                cheapest_price = price
-                cheapest_date = date
+            if not flights:
+                continue
+
+            for f in flights:
+                price = f.get("price")
+                if price is None:
+                    continue
+
+                if cheapest_price is None or price < cheapest_price:
+                    cheapest_price = price
+                    cheapest_date = date
 
         except Exception as e:
             logging.error(f"Flight fetch error: {e}")
@@ -253,7 +272,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(u[0], text)
                 sent += 1
             except Exception as e:
-                logging.error(f"Failed to send to {u[0]}: {e}")
+                logging.error(f"Broadcast failed {u[0]}: {e}")
 
         broadcast_mode[ADMIN_ID] = False
         await update.message.reply_text(f"Sent to {sent} users")
@@ -287,14 +306,16 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
-    # Runs daily at 09:00 UTC
-    job = app.job_queue
-    job.run_daily(daily_job, time=datetime.strptime("09:00", "%H:%M").time())
+    if app.job_queue:
+        app.job_queue.run_daily(
+            daily_job,
+            time=datetime.strptime("09:00", "%H:%M").time()
+        )
 
     print("Flightly running...")
     app.run_polling()
