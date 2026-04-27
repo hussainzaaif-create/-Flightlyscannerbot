@@ -3,7 +3,7 @@ import sqlite3
 import time
 import threading
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime
 
 import requests
 
@@ -31,10 +31,10 @@ SERP_API_KEY = os.getenv("SERP_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing in environment variables")
+    raise ValueError("BOT_TOKEN missing")
 
 if not SERP_API_KEY:
-    raise ValueError("SERP_API_KEY missing in environment variables")
+    raise ValueError("SERP_API_KEY missing")
 
 MONTHLY_STARS = 300
 YEARLY_STARS = 2100
@@ -65,7 +65,8 @@ with db_lock:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         origin TEXT,
-        destination TEXT
+        destination TEXT,
+        last_price REAL
     )
     """)
     conn.commit()
@@ -104,49 +105,35 @@ def is_premium(user_id):
 
 # ================= FLIGHT DATA =================
 
-def get_cheapest_flight(origin, destination):
-    cheapest_price = None
-    cheapest_date = None
+def get_live_price(origin, destination):
+    url = "https://serpapi.com/search.json"
 
-    for i in range(1, 8):
-        date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
+    params = {
+        "engine": "google_flights",
+        "departure_id": origin,
+        "arrival_id": destination,
+        "currency": "USD",
+        "hl": "en",
+        "api_key": SERP_API_KEY
+    }
 
-        url = "https://serpapi.com/search.json"
+    try:
+        r = requests.get(url, params=params, timeout=15)
 
-        params = {
-            "engine": "google_flights",
-            "departure_id": origin,
-            "arrival_id": destination,
-            "outbound_date": date,
-            "currency": "USD",
-            "hl": "en",
-            "api_key": SERP_API_KEY
-        }
+        if r.status_code != 200:
+            logging.error(f"Bad response {r.status_code}: {r.text}")
+            return None
 
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
+        data = r.json()
 
-            best = data.get("best_flights", [])
-            other = data.get("other_flights", [])
-            flights = best + other
+        flights = data.get("best_flights", []) + data.get("other_flights", [])
+        prices = [f.get("price") for f in flights if f.get("price")]
 
-            if not flights:
-                continue
+        return min(prices) if prices else None
 
-            for f in flights:
-                price = f.get("price")
-                if price is None:
-                    continue
-
-                if cheapest_price is None or price < cheapest_price:
-                    cheapest_price = price
-                    cheapest_date = date
-
-        except Exception as e:
-            logging.error(f"Flight fetch error: {e}")
-
-    return cheapest_price, cheapest_date
+    except Exception as e:
+        logging.error(f"Live price error: {e}")
+        return None
 
 # ================= UI =================
 
@@ -168,7 +155,7 @@ def upgrade_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✈️ Welcome to Flightly!\nTrack real cheap flights daily.",
+        "✈️ Welcome to Flightly!\nTrack real flight price drops.",
         reply_markup=main_menu()
     )
 
@@ -182,24 +169,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     if data == "menu":
+        context.user_data.clear()
         await q.edit_message_text("Main Menu", reply_markup=main_menu())
 
     elif data == "add_route":
-        await q.edit_message_text("Feature coming soon ✈️")
+        context.user_data["adding_route"] = True
+        await q.edit_message_text("Send route like:\nMLE DXB")
 
+    # ✅ FIXED: Removed hardcoded MLE-DXB and replaced with user routes
     elif data == "deals":
         if not is_premium(user_id):
             await q.edit_message_text("🔒 Premium required", reply_markup=upgrade_menu())
             return
 
-        price, date = get_cheapest_flight("MLE", "DXB")
+        with db_lock:
+            cur.execute("SELECT origin, destination FROM routes WHERE user_id=?", (user_id,))
+            routes = cur.fetchall()
 
-        if price:
-            msg = f"🔥 Cheapest Flight\n\nMLE → DXB\n💰 ${price}\n📅 {date}"
-        else:
-            msg = "⚠️ Could not fetch deals right now"
+        if not routes:
+            await q.edit_message_text("No routes yet. Add one first ✈️")
+            return
 
-        await q.edit_message_text(msg)
+        messages = []
+
+        for origin, destination in routes:
+            price = get_live_price(origin, destination)
+
+            if price:
+                messages.append(f"{origin} → {destination} 💰 ${price}")
+            else:
+                messages.append(f"{origin} → {destination} ❌ no data")
+
+        await q.edit_message_text(
+            "🌍 Your Routes:\n\n" + "\n".join(messages)
+        )
 
     elif data == "upgrade":
         await q.edit_message_text("Upgrade Flightly", reply_markup=upgrade_menu())
@@ -210,8 +213,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="Flightly Monthly",
             description="Premium access",
             payload="monthly",
-            provider_token="",
-            currency="XTR",
+            provider_token="YOUR_PROVIDER_TOKEN_HERE",
+            currency="USD",
             prices=[LabeledPrice("Monthly", MONTHLY_STARS)]
         )
 
@@ -221,8 +224,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="Flightly Yearly",
             description="Premium access",
             payload="yearly",
-            provider_token="",
-            currency="XTR",
+            provider_token="YOUR_PROVIDER_TOKEN_HERE",
+            currency="USD",
             prices=[LabeledPrice("Yearly", YEARLY_STARS)]
         )
 
@@ -244,81 +247,97 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("✅ Premium Activated!", reply_markup=main_menu())
 
-# ================= BROADCAST =================
-
-broadcast_mode = {}
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    broadcast_mode[ADMIN_ID] = True
-    await update.message.reply_text("Send broadcast message now")
+# ================= MESSAGE HANDLER =================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if broadcast_mode.get(ADMIN_ID) and user_id == ADMIN_ID:
-        text = update.message.text or ""
+    if context.user_data.get("adding_route"):
+        try:
+            origin, destination = update.message.text.upper().split()
 
-        with db_lock:
-            cur.execute("SELECT id FROM users")
-            users = cur.fetchall()
+            with db_lock:
+                cur.execute(
+                    "INSERT INTO routes (user_id, origin, destination, last_price) VALUES (?, ?, ?, ?)",
+                    (user_id, origin, destination, None)
+                )
+                conn.commit()
 
-        sent = 0
+            context.user_data["adding_route"] = False
 
-        for u in users:
-            try:
-                await context.bot.send_message(u[0], text)
-                sent += 1
-            except Exception as e:
-                logging.error(f"Broadcast failed {u[0]}: {e}")
+            await update.message.reply_text(
+                f"✅ Tracking {origin} → {destination}",
+                reply_markup=main_menu()
+            )
 
-        broadcast_mode[ADMIN_ID] = False
-        await update.message.reply_text(f"Sent to {sent} users")
+        except:
+            await update.message.reply_text("Invalid format. Use: MLE DXB")
 
 # ================= DAILY JOB =================
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Running price tracker...")
+
     with db_lock:
-        cur.execute("SELECT id FROM users")
-        users = cur.fetchall()
+        cur.execute("SELECT id, user_id, origin, destination, last_price FROM routes")
+        routes = cur.fetchall()
 
-    price, date = get_cheapest_flight("MLE", "DXB")
+    for route_id, user_id, origin, destination, last_price in routes:
+        new_price = get_live_price(origin, destination)
 
-    if price:
-        message = f"✈️ Flightly Daily Deal\n\nMLE → DXB\n💰 ${price}\n📅 {date}"
-    else:
-        message = "⚠️ Could not fetch flight deals today"
+        if not new_price:
+            continue
 
-    for u in users:
-        try:
-            await context.bot.send_message(u[0], message)
-        except Exception as e:
-            logging.error(f"Daily send failed {u[0]}: {e}")
+        if last_price is None:
+            with db_lock:
+                cur.execute(
+                    "UPDATE routes SET last_price=? WHERE id=?",
+                    (new_price, route_id)
+                )
+                conn.commit()
+            continue
+
+        if new_price < last_price:
+            drop = last_price - new_price
+
+            msg = (
+                f"🚨 Price Drop!\n\n"
+                f"{origin} → {destination}\n"
+                f"💰 ${new_price} (was ${last_price})\n"
+                f"🔻 Saved ${drop}"
+            )
+
+            try:
+                await context.bot.send_message(user_id, msg)
+            except Exception as e:
+                logging.error(f"Send failed {user_id}: {e}")
+
+        with db_lock:
+            cur.execute(
+                "UPDATE routes SET last_price=? WHERE id=?",
+                (new_price, route_id)
+            )
+            conn.commit()
 
 # ================= MAIN =================
 
 def main():
+    logging.info("Starting Flightly...")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
     if app.job_queue:
-        app.job_queue.run_daily(
-            daily_job,
-            time=datetime.strptime("09:00", "%H:%M").time()
-        )
+        app.job_queue.run_daily(daily_job, time=dtime(hour=9, minute=0))
+        logging.info("Daily job scheduled")
 
-    print("Flightly running...")
-    app.run_polling()
+    logging.info("Bot running...")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
